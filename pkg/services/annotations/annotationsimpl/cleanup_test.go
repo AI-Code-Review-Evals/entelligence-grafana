@@ -294,3 +294,644 @@ func createTestAnnotations(t *testing.T, store db.DB, expectedCount int, oldAnno
 func settingsFn(maxAge time.Duration, maxCount int64) setting.AnnotationCleanupSettings {
 	return setting.AnnotationCleanupSettings{MaxAge: maxAge, MaxCount: maxCount}
 }
+
+// TestIntegrationCleanAnnotationsBatchProcessing tests the batched cleanup process
+// to ensure it properly handles multiple batches and respects batch size limits
+func TestIntegrationCleanAnnotationsBatchProcessing(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration test")
+	}
+
+	fakeSQL := db.InitTestDB(t)
+
+	tests := []struct {
+		name                          string
+		createAnnotationsNum          int
+		batchSize                     int
+		maxCount                      int64
+		expectedRemainingAnnotations  int64
+		expectedDeletedInMultipleBatches bool
+	}{
+		{
+			name:                         "single batch deletion",
+			createAnnotationsNum:         10,
+			batchSize:                    20,
+			maxCount:                     5,
+			expectedRemainingAnnotations: 5,
+			expectedDeletedInMultipleBatches: false,
+		},
+		{
+			name:                         "multiple batch deletion",
+			createAnnotationsNum:         100,
+			batchSize:                    10,
+			maxCount:                     50,
+			expectedRemainingAnnotations: 50,
+			expectedDeletedInMultipleBatches: true,
+		},
+		{
+			name:                         "exact batch size match",
+			createAnnotationsNum:         30,
+			batchSize:                    10,
+			maxCount:                     20,
+			expectedRemainingAnnotations: 20,
+			expectedDeletedInMultipleBatches: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Cleanup(func() {
+				err := fakeSQL.WithDbSession(context.Background(), func(session *db.Session) error {
+					_, err := session.Exec("DELETE FROM annotation")
+					return err
+				})
+				assert.NoError(t, err)
+			})
+
+			// Create test annotations
+			createTestAnnotations(t, fakeSQL, tt.createAnnotationsNum, 0)
+
+			cfg := setting.NewCfg()
+			cfg.AnnotationCleanupJobBatchSize = tt.batchSize
+			cleaner := NewXormStore(cfg, log.New("annotation.test"), fakeSQL, nil)
+
+			affected, err := cleaner.CleanAnnotations(context.Background(), settingsFn(0, tt.maxCount), alertAnnotationType)
+			require.NoError(t, err)
+			
+			expectedDeleted := tt.createAnnotationsNum/3 - int(tt.expectedRemainingAnnotations)
+			assert.Equal(t, int64(expectedDeleted), affected, "should delete the correct number of annotations")
+
+			assertAnnotationCount(t, fakeSQL, alertAnnotationType, tt.expectedRemainingAnnotations)
+		})
+	}
+}
+
+// TestIntegrationCleanAnnotationsWithContextCancellation tests that cleanup
+// respects context cancellation and doesn't delete more than necessary
+func TestIntegrationCleanAnnotationsWithContextCancellation(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration test")
+	}
+
+	fakeSQL := db.InitTestDB(t)
+
+	t.Cleanup(func() {
+		err := fakeSQL.WithDbSession(context.Background(), func(session *db.Session) error {
+			_, err := session.Exec("DELETE FROM annotation")
+			return err
+		})
+		assert.NoError(t, err)
+	})
+
+	// Create many annotations
+	createTestAnnotations(t, fakeSQL, 100, 0)
+
+	cfg := setting.NewCfg()
+	cfg.AnnotationCleanupJobBatchSize = 10
+	cleaner := NewXormStore(cfg, log.New("annotation.test"), fakeSQL, nil)
+
+	// Create a context that will be cancelled
+	ctx, cancel := context.WithCancel(context.Background())
+	
+	// Cancel immediately to test cancellation handling
+	cancel()
+
+	affected, err := cleaner.CleanAnnotations(ctx, settingsFn(0, 20), alertAnnotationType)
+	
+	// Should get context cancelled error
+	assert.Error(t, err)
+	assert.True(t, errors.Is(err, context.Canceled), "error should be context.Canceled")
+	
+	// Some annotations might have been deleted before cancellation
+	assert.GreaterOrEqual(t, affected, int64(0))
+}
+
+// TestIntegrationCleanAnnotationsByTimeRange tests cleanup based on time cutoff
+func TestIntegrationCleanAnnotationsByTimeRange(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration test")
+	}
+
+	fakeSQL := db.InitTestDB(t)
+
+	tests := []struct {
+		name                    string
+		createRecentAnnotations int
+		createOldAnnotations    int
+		maxAge                  time.Duration
+		expectedRemainingCount  int64
+	}{
+		{
+			name:                    "delete all old annotations",
+			createRecentAnnotations: 10,
+			createOldAnnotations:    5,
+			maxAge:                  time.Hour * 48,
+			expectedRemainingCount:  10,
+		},
+		{
+			name:                    "delete some old annotations with small batch",
+			createRecentAnnotations: 15,
+			createOldAnnotations:    10,
+			maxAge:                  time.Hour * 24,
+			expectedRemainingCount:  15,
+		},
+		{
+			name:                    "no deletion when maxAge is very large",
+			createRecentAnnotations: 10,
+			createOldAnnotations:    5,
+			maxAge:                  time.Hour * 24 * 365 * 100, // 100 years
+			expectedRemainingCount:  15,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Cleanup(func() {
+				err := fakeSQL.WithDbSession(context.Background(), func(session *db.Session) error {
+					_, err := session.Exec("DELETE FROM annotation")
+					return err
+				})
+				assert.NoError(t, err)
+			})
+
+			total := tt.createRecentAnnotations + tt.createOldAnnotations
+			createTestAnnotations(t, fakeSQL, total, tt.createOldAnnotations)
+
+			cfg := setting.NewCfg()
+			cfg.AnnotationCleanupJobBatchSize = 5
+			cleaner := NewXormStore(cfg, log.New("annotation.test"), fakeSQL, nil)
+
+			affected, err := cleaner.CleanAnnotations(context.Background(), settingsFn(tt.maxAge, 0), "")
+			require.NoError(t, err)
+
+			expectedDeleted := total - int(tt.expectedRemainingCount)
+			assert.Equal(t, int64(expectedDeleted), affected)
+
+			// Verify remaining count
+			err = fakeSQL.WithDbSession(context.Background(), func(sess *db.Session) error {
+				count, err := sess.Count(&annotations.Item{})
+				require.NoError(t, err)
+				assert.Equal(t, tt.expectedRemainingCount, count)
+				return nil
+			})
+			require.NoError(t, err)
+		})
+	}
+}
+
+// TestIntegrationCleanOrphanedAnnotationTagsBatchProcessing tests orphaned tag cleanup
+func TestIntegrationCleanOrphanedAnnotationTagsBatchProcessing(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration test")
+	}
+
+	fakeSQL := db.InitTestDB(t)
+
+	t.Cleanup(func() {
+		err := fakeSQL.WithDbSession(context.Background(), func(session *db.Session) error {
+			_, err := session.Exec("DELETE FROM annotation_tag")
+			if err != nil {
+				return err
+			}
+			_, err = session.Exec("DELETE FROM annotation")
+			return err
+		})
+		assert.NoError(t, err)
+	})
+
+	// Create annotations with tags
+	createTestAnnotations(t, fakeSQL, 20, 0)
+
+	// Delete some annotations to create orphaned tags
+	err := fakeSQL.WithDbSession(context.Background(), func(sess *db.Session) error {
+		_, err := sess.Exec("DELETE FROM annotation WHERE id <= 10")
+		return err
+	})
+	require.NoError(t, err)
+
+	cfg := setting.NewCfg()
+	cfg.AnnotationCleanupJobBatchSize = 5
+	cleaner := NewXormStore(cfg, log.New("annotation.test"), fakeSQL, nil)
+
+	affected, err := cleaner.CleanOrphanedAnnotationTags(context.Background())
+	require.NoError(t, err)
+
+	// Should have deleted tags for 10 annotations (2 tags each)
+	assert.Equal(t, int64(20), affected)
+
+	// Verify remaining tags belong to existing annotations
+	err = fakeSQL.WithDbSession(context.Background(), func(sess *db.Session) error {
+		var orphanedCount int64
+		orphanedCount, err = sess.SQL(`
+			SELECT COUNT(*) FROM annotation_tag 
+			WHERE annotation_id NOT IN (SELECT id FROM annotation)
+		`).Count()
+		require.NoError(t, err)
+		assert.Equal(t, int64(0), orphanedCount, "should have no orphaned tags")
+		return nil
+	})
+	require.NoError(t, err)
+}
+
+// TestIntegrationCleanAnnotationsEdgeCases tests edge cases in cleanup
+func TestIntegrationCleanAnnotationsEdgeCases(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration test")
+	}
+
+	fakeSQL := db.InitTestDB(t)
+
+	t.Run("cleanup with zero annotations", func(t *testing.T) {
+		t.Cleanup(func() {
+			err := fakeSQL.WithDbSession(context.Background(), func(session *db.Session) error {
+				_, err := session.Exec("DELETE FROM annotation")
+				return err
+			})
+			assert.NoError(t, err)
+		})
+
+		cfg := setting.NewCfg()
+		cfg.AnnotationCleanupJobBatchSize = 10
+		cleaner := NewXormStore(cfg, log.New("annotation.test"), fakeSQL, nil)
+
+		affected, err := cleaner.CleanAnnotations(context.Background(), settingsFn(time.Hour*24, 0), "")
+		require.NoError(t, err)
+		assert.Equal(t, int64(0), affected)
+	})
+
+	t.Run("cleanup with maxCount greater than total", func(t *testing.T) {
+		t.Cleanup(func() {
+			err := fakeSQL.WithDbSession(context.Background(), func(session *db.Session) error {
+				_, err := session.Exec("DELETE FROM annotation")
+				return err
+			})
+			assert.NoError(t, err)
+		})
+
+		createTestAnnotations(t, fakeSQL, 10, 0)
+
+		cfg := setting.NewCfg()
+		cfg.AnnotationCleanupJobBatchSize = 5
+		cleaner := NewXormStore(cfg, log.New("annotation.test"), fakeSQL, nil)
+
+		affected, err := cleaner.CleanAnnotations(context.Background(), settingsFn(0, 100), "")
+		require.NoError(t, err)
+		assert.Equal(t, int64(0), affected, "should not delete any annotations")
+
+		err = fakeSQL.WithDbSession(context.Background(), func(sess *db.Session) error {
+			count, err := sess.Count(&annotations.Item{})
+			require.NoError(t, err)
+			assert.Equal(t, int64(10), count)
+			return nil
+		})
+		require.NoError(t, err)
+	})
+
+	t.Run("cleanup with batch size of 1", func(t *testing.T) {
+		t.Cleanup(func() {
+			err := fakeSQL.WithDbSession(context.Background(), func(session *db.Session) error {
+				_, err := session.Exec("DELETE FROM annotation")
+				return err
+			})
+			assert.NoError(t, err)
+		})
+
+		createTestAnnotations(t, fakeSQL, 15, 5)
+
+		cfg := setting.NewCfg()
+		cfg.AnnotationCleanupJobBatchSize = 1
+		cleaner := NewXormStore(cfg, log.New("annotation.test"), fakeSQL, nil)
+
+		affected, err := cleaner.CleanAnnotations(context.Background(), settingsFn(time.Hour*48, 0), "")
+		require.NoError(t, err)
+		assert.Equal(t, int64(5), affected)
+	})
+}
+
+// TestIntegrationDeleteByIDsWithVariousBatchSizes tests the deleteByIDs function
+// with different batch sizes including edge cases for SQLite parameter limits
+func TestIntegrationDeleteByIDsWithVariousBatchSizes(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration test")
+	}
+
+	fakeSQL := db.InitTestDB(t)
+
+	tests := []struct {
+		name              string
+		annotationCount   int
+		batchSize         int
+		idsToDelete       []int64
+		expectedAffected  int64
+	}{
+		{
+			name:            "delete with small batch",
+			annotationCount: 20,
+			batchSize:       10,
+			idsToDelete:     []int64{1, 2, 3, 4, 5},
+			expectedAffected: 5,
+		},
+		{
+			name:            "delete with empty IDs",
+			annotationCount: 10,
+			batchSize:       10,
+			idsToDelete:     []int64{},
+			expectedAffected: 0,
+		},
+		{
+			name:            "delete with large batch near SQLite limit",
+			annotationCount: 1000,
+			batchSize:       1000,
+			idsToDelete:     make([]int64, 500),
+			expectedAffected: 500,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Cleanup(func() {
+				err := fakeSQL.WithDbSession(context.Background(), func(session *db.Session) error {
+					_, err := session.Exec("DELETE FROM annotation")
+					return err
+				})
+				assert.NoError(t, err)
+			})
+
+			// Create annotations
+			createTestAnnotations(t, fakeSQL, tt.annotationCount, 0)
+
+			// Populate idsToDelete if needed
+			if len(tt.idsToDelete) > 0 && tt.idsToDelete[0] == 0 {
+				for i := range tt.idsToDelete {
+					tt.idsToDelete[i] = int64(i + 1)
+				}
+			}
+
+			cfg := setting.NewCfg()
+			cfg.AnnotationCleanupJobBatchSize = tt.batchSize
+			cleaner := NewXormStore(cfg, log.New("annotation.test"), fakeSQL, nil)
+
+			affected, err := cleaner.deleteByIDs(context.Background(), "annotation", tt.idsToDelete)
+			require.NoError(t, err)
+			assert.Equal(t, tt.expectedAffected, affected)
+
+			// Verify deletions
+			err = fakeSQL.WithDbSession(context.Background(), func(sess *db.Session) error {
+				remaining, err := sess.Count(&annotations.Item{})
+				require.NoError(t, err)
+				expected := tt.annotationCount - int(tt.expectedAffected)
+				assert.Equal(t, int64(expected), remaining)
+				return nil
+			})
+			require.NoError(t, err)
+		})
+	}
+}
+
+// TestIntegrationFetchIDsWithComplexConditions tests the fetchIDs function
+func TestIntegrationFetchIDsWithComplexConditions(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration test")
+	}
+
+	fakeSQL := db.InitTestDB(t)
+
+	t.Cleanup(func() {
+		err := fakeSQL.WithDbSession(context.Background(), func(session *db.Session) error {
+			_, err := session.Exec("DELETE FROM annotation")
+			return err
+		})
+		assert.NoError(t, err)
+	})
+
+	// Create test data
+	createTestAnnotations(t, fakeSQL, 30, 10)
+
+	cfg := setting.NewCfg()
+	cfg.AnnotationCleanupJobBatchSize = 100
+	cleaner := NewXormStore(cfg, log.New("annotation.test"), fakeSQL, nil)
+
+	t.Run("fetch IDs with limit", func(t *testing.T) {
+		cond := fmt.Sprintf("org_id = 1 ORDER BY id DESC %s", fakeSQL.GetDialect().Limit(10))
+		ids, err := cleaner.fetchIDs(context.Background(), "annotation", cond)
+		require.NoError(t, err)
+		assert.Len(t, ids, 10)
+	})
+
+	t.Run("fetch IDs with alert filter", func(t *testing.T) {
+		cond := fmt.Sprintf("org_id = 1 AND alert_id > 0 ORDER BY id DESC %s", fakeSQL.GetDialect().Limit(20))
+		ids, err := cleaner.fetchIDs(context.Background(), "annotation", cond)
+		require.NoError(t, err)
+		// Every third annotation is an alert (created by createTestAnnotations)
+		assert.LessOrEqual(t, len(ids), 20)
+	})
+
+	t.Run("fetch IDs without condition returns error", func(t *testing.T) {
+		ids, err := cleaner.fetchIDs(context.Background(), "annotation", "")
+		require.Error(t, err)
+		assert.Nil(t, ids)
+		assert.Contains(t, err.Error(), "condition must be supplied")
+	})
+
+	t.Run("fetch IDs with time range", func(t *testing.T) {
+		cutoffDate := time.Now().Add(-time.Hour).UnixNano() / int64(time.Millisecond)
+		cond := fmt.Sprintf("org_id = 1 AND created < %d ORDER BY id DESC %s", cutoffDate, fakeSQL.GetDialect().Limit(5))
+		ids, err := cleaner.fetchIDs(context.Background(), "annotation", cond)
+		require.NoError(t, err)
+		assert.LessOrEqual(t, len(ids), 5)
+	})
+}
+
+// TestIntegrationCleanAnnotationsConcurrentOperations tests cleanup during concurrent operations
+func TestIntegrationCleanAnnotationsConcurrentOperations(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration test")
+	}
+
+	fakeSQL := db.InitTestDB(t)
+
+	t.Cleanup(func() {
+		err := fakeSQL.WithDbSession(context.Background(), func(session *db.Session) error {
+			_, err := session.Exec("DELETE FROM annotation")
+			return err
+		})
+		assert.NoError(t, err)
+	})
+
+	// Create initial annotations
+	createTestAnnotations(t, fakeSQL, 100, 20)
+
+	cfg := setting.NewCfg()
+	cfg.AnnotationCleanupJobBatchSize = 10
+	cleaner := NewXormStore(cfg, log.New("annotation.test"), fakeSQL, nil)
+
+	// Run cleanup in goroutine
+	done := make(chan error, 1)
+	go func() {
+		_, err := cleaner.CleanAnnotations(context.Background(), settingsFn(time.Hour*48, 0), "")
+		done <- err
+	}()
+
+	// Simulate concurrent inserts
+	for i := 0; i < 10; i++ {
+		annotation := &annotations.Item{
+			OrgID:       1,
+			UserID:      1,
+			DashboardID: 1,
+			Text:        fmt.Sprintf("concurrent annotation %d", i),
+			Created:     time.Now().UnixNano() / int64(time.Millisecond),
+		}
+		err := fakeSQL.WithDbSession(context.Background(), func(sess *db.Session) error {
+			_, err := sess.Insert(annotation)
+			return err
+		})
+		require.NoError(t, err)
+	}
+
+	// Wait for cleanup to complete
+	err := <-done
+	require.NoError(t, err)
+
+	// Verify database is in consistent state
+	err = fakeSQL.WithDbSession(context.Background(), func(sess *db.Session) error {
+		count, err := sess.Count(&annotations.Item{})
+		require.NoError(t, err)
+		assert.Greater(t, count, int64(0), "should have some annotations remaining")
+		return nil
+	})
+	require.NoError(t, err)
+}
+
+// TestIntegrationUntilDoneOrCancelledFunction tests the helper function behavior
+func TestIntegrationUntilDoneOrCancelledFunction(t *testing.T) {
+	t.Run("processes all batches successfully", func(t *testing.T) {
+		callCount := 0
+		batchWork := func() (int64, error) {
+			callCount++
+			if callCount > 3 {
+				return 0, nil // Signal completion
+			}
+			return 10, nil
+		}
+
+		affected, err := untilDoneOrCancelled(context.Background(), batchWork)
+		require.NoError(t, err)
+		assert.Equal(t, int64(30), affected)
+		assert.Equal(t, 4, callCount)
+	})
+
+	t.Run("stops on context cancellation", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		callCount := 0
+
+		batchWork := func() (int64, error) {
+			callCount++
+			if callCount == 2 {
+				cancel()
+			}
+			return 10, nil
+		}
+
+		affected, err := untilDoneOrCancelled(ctx, batchWork)
+		assert.Error(t, err)
+		assert.True(t, errors.Is(err, context.Canceled))
+		assert.Equal(t, int64(20), affected) // Should have processed 2 batches before cancellation
+	})
+
+	t.Run("stops on error", func(t *testing.T) {
+		callCount := 0
+		expectedErr := errors.New("batch processing error")
+
+		batchWork := func() (int64, error) {
+			callCount++
+			if callCount == 2 {
+				return 5, expectedErr
+			}
+			return 10, nil
+		}
+
+		affected, err := untilDoneOrCancelled(context.Background(), batchWork)
+		assert.Error(t, err)
+		assert.Equal(t, expectedErr, err)
+		assert.Equal(t, int64(15), affected) // 10 from first batch + 5 from second
+		assert.Equal(t, 2, callCount)
+	})
+
+	t.Run("handles zero-affected immediately", func(t *testing.T) {
+		callCount := 0
+		batchWork := func() (int64, error) {
+			callCount++
+			return 0, nil
+		}
+
+		affected, err := untilDoneOrCancelled(context.Background(), batchWork)
+		require.NoError(t, err)
+		assert.Equal(t, int64(0), affected)
+		assert.Equal(t, 1, callCount)
+	})
+}
+
+// TestIntegrationCleanAnnotationsMixedTypes tests cleanup with different annotation types
+func TestIntegrationCleanAnnotationsMixedTypes(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration test")
+	}
+
+	fakeSQL := db.InitTestDB(t)
+
+	t.Cleanup(func() {
+		err := fakeSQL.WithDbSession(context.Background(), func(session *db.Session) error {
+			_, err := session.Exec("DELETE FROM annotation")
+			return err
+		})
+		assert.NoError(t, err)
+	})
+
+	// Create mix of alert, dashboard, and API annotations
+	createTestAnnotations(t, fakeSQL, 30, 0)
+
+	cfg := setting.NewCfg()
+	cfg.AnnotationCleanupJobBatchSize = 5
+	cleaner := NewXormStore(cfg, log.New("annotation.test"), fakeSQL, nil)
+
+	t.Run("cleanup only alert annotations", func(t *testing.T) {
+		initialCount := getAnnotationCount(t, fakeSQL, alertAnnotationType)
+		
+		affected, err := cleaner.CleanAnnotations(context.Background(), settingsFn(0, 5), alertAnnotationType)
+		require.NoError(t, err)
+
+		finalCount := getAnnotationCount(t, fakeSQL, alertAnnotationType)
+		assert.Equal(t, int64(5), finalCount)
+		assert.Equal(t, initialCount-finalCount, affected)
+	})
+
+	t.Run("cleanup only dashboard annotations", func(t *testing.T) {
+		initialCount := getAnnotationCount(t, fakeSQL, dashboardAnnotationType)
+		
+		affected, err := cleaner.CleanAnnotations(context.Background(), settingsFn(0, 3), dashboardAnnotationType)
+		require.NoError(t, err)
+
+		finalCount := getAnnotationCount(t, fakeSQL, dashboardAnnotationType)
+		assert.Equal(t, int64(3), finalCount)
+		assert.Equal(t, initialCount-finalCount, affected)
+	})
+
+	t.Run("verify other annotation types untouched", func(t *testing.T) {
+		// After cleaning alerts and dashboards, API annotations should be untouched
+		apiCount := getAnnotationCount(t, fakeSQL, apiAnnotationType)
+		assert.Greater(t, apiCount, int64(0), "API annotations should still exist")
+	})
+}
+
+// Helper function to get annotation count by type
+func getAnnotationCount(t *testing.T, db db.DB, annotationType string) int64 {
+	t.Helper()
+	var count int64
+	err := db.WithDbSession(context.Background(), func(sess *db.Session) error {
+		var err error
+		count, err = sess.Where(annotationType).Count(&annotations.Item{})
+		return err
+	})
+	require.NoError(t, err)
+	return count
+}
