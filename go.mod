@@ -204,7 +204,7 @@ require (
 	golang.org/x/text v0.26.0 // @grafana/grafana-backend-group
 	golang.org/x/time v0.11.0 // @grafana/grafana-backend-group
 	golang.org/x/tools v0.34.0 // indirect; @grafana/grafana-as-code
-	gonum.org/v1/gonum v0.16.0 // @grafana/oss-big-tent
+	gonum.org/v1/gonum v0.17.0 // @grafana/oss-big-tent
 	google.golang.org/api v0.235.0 // @grafana/grafana-backend-group
 	google.golang.org/grpc v1.73.0 // @grafana/plugins-platform-backend
 	google.golang.org/protobuf v1.36.6 // @grafana/plugins-platform-backend
