@@ -166,7 +166,7 @@ require (
 	github.com/spf13/cobra v1.9.1 // @grafana/grafana-app-platform-squad
 	github.com/spf13/pflag v1.0.6 // @grafana-app-platform-squad
 	github.com/spyzhov/ajson v0.9.6 // @grafana/grafana-sharing-squad
-	github.com/stretchr/testify v1.10.0 // @grafana/grafana-backend-group
+	github.com/stretchr/testify v1.11.1 // @grafana/grafana-backend-group
 	github.com/teris-io/shortid v0.0.0-20171029131806-771a37caa5cf // @grafana/grafana-backend-group
 	github.com/tjhop/slog-gokit v0.1.3 // @grafana/grafana-app-platform-squad
 	github.com/ua-parser/uap-go v0.0.0-20250213224047-9c035f085b90 // @grafana/grafana-backend-group
@@ -208,7 +208,7 @@ require (
 	google.golang.org/api v0.235.0 // @grafana/grafana-backend-group
 	google.golang.org/grpc v1.73.0 // @grafana/plugins-platform-backend
 	google.golang.org/protobuf v1.36.6 // @grafana/plugins-platform-backend
-	gopkg.in/ini.v1 v1.67.0 // @grafana/alerting-backend
+	gopkg.in/ini.v1 v1.67.1 // @grafana/alerting-backend
 	gopkg.in/mail.v2 v2.3.1 // @grafana/grafana-backend-group
 	gopkg.in/yaml.v2 v2.4.0 // @grafana/alerting-backend
 	gopkg.in/yaml.v3 v3.0.1 // @grafana/alerting-backend
