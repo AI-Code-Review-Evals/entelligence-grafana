@@ -30,7 +30,7 @@ jobs:
           persist-credentials: false
 
       - name: "Setup Go"
-        uses: "actions/setup-go@19bb51245e9c80abacb2e91cc42b33fa478b8639"
+        uses: "actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16"
         with:
           go-version-file: go.mod
 
