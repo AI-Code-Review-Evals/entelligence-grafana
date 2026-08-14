@@ -32,6 +32,6 @@ jobs:
           fetch-depth: ${{ steps.fetch_depth.outputs.fetch_depth }}
           ref: ${{ github.event.pull_request.head.ref }}
       - name: Trufflehog
-        uses: trufflesecurity/trufflehog@eafb8c5f6a06175141c27f17bcc17941853d0047 # v3.90.0
+        uses: trufflesecurity/trufflehog@6f3c981e7b77f235fd2702dd74af25fc4b72bf11 # v3.96.0
         with:
           extra_args: --results=verified
