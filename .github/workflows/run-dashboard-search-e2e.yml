@@ -51,7 +51,7 @@ jobs:
         run: yarn install --immutable
       - name: Install Cypress dependencies
         if: steps.cache-node-modules.outputs.cache-hit != 'true'
-        uses: cypress-io/github-action@108b8684ae52e735ff7891524cbffbcd4be5b19f
+        uses: cypress-io/github-action@18016a55674bd02cabf197de5762a1710cb5577c
         with:
           runTests: false
       - name: Cache Grafana Build and Dependencies
